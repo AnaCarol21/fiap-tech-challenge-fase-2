@@ -1,0 +1,5 @@
+# dados gerados pelo pipeline
+*.parquet
+.ipynb_checkpoints/
+
+notebooks/cloud/bronze/alunos.parquet notebooks/cloud/bronze/meta_alfabetizacao_brasil.parquet notebooks/cloud/bronze/meta_alfabetizacao_municipio.parquet notebooks/cloud/bronze/meta_alfabetizacao_uf.parquet notebooks/cloud/bronze/municipio.parquet notebooks/cloud/bronze/uf.parquet
