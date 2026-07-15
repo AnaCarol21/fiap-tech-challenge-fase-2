@@ -116,6 +116,9 @@ A camada Gold foi desenhada para servir de base a análises mais avançadas:
 
 ```
 docs/
+    apresentacao/
+        video.mp4
+        apresentacao.ppt
     evidencias/
         fotos tiradas do S3 para evidências do uso do AWS
   modelo_dados.md         # documentação das tabelas de dados
