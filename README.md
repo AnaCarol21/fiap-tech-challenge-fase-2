@@ -10,7 +10,7 @@ Projeto desenvolvido para o Tech Challenge da Pós-Tech FIAP (Fase 2), com o obj
 
 A alfabetização na infância é um dos pilares fundamentais para o desenvolvimento educacional, social e econômico do país. Nesse cenário, o **Compromisso Nacional Criança Alfabetizada** mobiliza União, estados, Distrito Federal e municípios com o objetivo de garantir que todas as crianças brasileiras estejam alfabetizadas até o final do 2º ano do ensino fundamental.
 
-Para apoiar essa política, o **INEP (Instituto Nacional de Estudos e Pesquisas Educacionais Anísio Teixeira)** realizou em 2023 a **Pesquisa Alfabetiza Brasil**, que definiu o ponto de corte de **743 pontos** na escala de proficiência do Saeb — a partir do qual uma criança é considerada alfabetizada. Com base nesse parâmetro, foi criado o **Indicador Criança Alfabetizada**, que expressa o percentual de estudantes que atingem esse patamar. A meta nacional é alfabetizar 100% das crianças até 2030.
+Para apoiar essa política, o **INEP (Instituto Nacional de Estudos e Pesquisas Educacionais Anísio Teixeira)** realizou em 2023 a **Pesquisa Alfabetiza Brasil**, que definiu o ponto de corte de **743 pontos** na escala de proficiência do Saeb, a partir do qual uma criança é considerada alfabetizada. Com base nesse parâmetro, foi criado o **Indicador Criança Alfabetizada**, que expressa o percentual de estudantes que atingem esse patamar. A meta nacional é alfabetizar 100% das crianças até 2030.
 
 Compreender os fatores que influenciam a alfabetização exige integrar diferentes fontes de dados: metas nacionais, estaduais e municipais, dados territoriais, microdados educacionais e indicadores de desempenho, em vez de olhar cada indicador isoladamente.
 
@@ -38,18 +38,18 @@ A pipeline segue a **Arquitetura Medalhão**, com ingestão híbrida convergindo
 
 ### Camadas em detalhe
 
-**Bronze — dados brutos**
+**Bronze: dados brutos (raw)**
 - Sem transformação de negócio, apenas padronização estrutural (schema, tipos básicos).
 - Histórico completo preservado (nenhum dado é descartado nesta camada).
 - Hash de registros para rastreabilidade e detecção de duplicidade futura.
 
-**Silver — dados tratados**
+**Silver: dados tratados**
 - Limpeza (remoção de duplicidade, tratamento de nulos essenciais).
 - Padronização de nomes de colunas e tipos.
 - Normalização de chaves (`sigla_uf`, `id_municipio`) para permitir joins consistentes.
 - Integração entre as bases (alunos + município + UF).
 
-**Gold — camada analítica**
+**Gold: camada analítica**
 - `ranking_uf`: ranking de UFs por taxa de alfabetização, por ano e rede de ensino.
 - `ranking_municipio`: mesmo ranking, no nível de município.
 - `evolucao_uf`: série histórica da taxa de alfabetização e proficiência em português por UF.
@@ -64,13 +64,21 @@ A pipeline segue a **Arquitetura Medalhão**, com ingestão híbrida convergindo
 | **Apache Kafka** | Ingestão streaming (Producer/Consumer) | Padrão de mercado para eventos quase em tempo real; simula atualizações de indicadores e metas |
 | **Amazon S3** | Data Lake (raw, bronze, silver, gold) | Armazenamento barato, durável e particionável em Parquet, desacoplado do processamento |
 | **AWS Glue** | Orquestração e execução das transformações em nuvem | Serverless (paga por uso), integração nativa com S3 e IAM, sem provisionar servidores |
-| **Parquet** | Formato de persistência em todas as camadas | Colunar, comprimido, com leitura seletiva de colunas — reduz custo de storage e de leitura |
+| **Parquet** | Formato de persistência em todas as camadas | Colunar, comprimido, com leitura seletiva de colunas, reduz custo de storage e de leitura |
 | **IAM Roles** | Controle de acesso (`AWSGlueServiceRole-TechChallenge`) | Princípio do menor privilégio: acesso restrito ao bucket do projeto e ao serviço Glue |
 
 ## 5. Decisões arquiteturais (trade-offs)
 
 **Batch vs. Streaming**
 Optamos por um modelo híbrido em vez de escolher só um dos dois. As metas e microdados educacionais (INEP/Base dos Dados) são publicados em ciclos (anual/periódico) batch é suficiente e mais barato para essas fontes. Já a simulação de atualizações de indicadores e resultados exige baixa latência de disponibilização, daí o uso de Kafka para essa fatia do problema, sem forçar todo o pipeline a rodar em streaming (o que encareceria a solução sem necessidade real).
+
+**GCP vs. AWS (arquitetura multi-cloud)**
+A extração dos dados foi feita via BigQuery (GCP), consultando a Base dos Dados através da biblioteca `basedosdados` com um projeto de billing próprio, enquanto toda a persistência e processamento (raw/bronze/silver/gold) acontece no S3/Glue (AWS). Essa combinação configura, portanto, uma arquitetura **multi-cloud**.
+
+- **Por que GCP na extração?** A Base dos Dados disponibiliza o dataset `br_inep_avaliacao_alfabetizacao` nativamente no BigQuery. Não existe uma via equivalente e oficial dessa fonte dentro do ecossistema AWS, então consultar o BigQuery é o caminho direto até a fonte pública, em vez de replicar/hospedar esses dados manualmente antes.
+- **Por que persistir em S3, e não deixar os dados no BigQuery?** Porque o restante da stack do projeto (Glue, Kafka, camadas Bronze/Silver/Gold, futuros dashboards e modelos) foi decidido em AWS. Trazer os dados para o S3 logo após a extração evita fragmentar a arquitetura em duas nuvens de forma permanente — o GCP é usado apenas como *ponte* de ingestão, não como parte do Data Lake.
+- **Custo:** as consultas via `basedosdados`/`bd.read_sql` utilizam a cota gratuita de processamento de queries do BigQuery (não há custo de armazenamento ou de cluster ficando ativo no GCP); o projeto de billing é usado apenas para autenticação/quota da extração pontual, sem gerar cobrança recorrente.
+- **Trade-off explícito:** manter duas nuvens aumenta a superfície de configuração e de controle de acesso (uma conta/IAM na AWS e um projeto de billing no GCP), mas evita o custo de reimplementar, dentro da AWS, uma fonte de dados que já existe pronta, pública e mantida por terceiros no BigQuery.
 
 **Data Lake vs. Data Warehouse**
 Escolhemos Data Lake (S3 + Parquet) em vez de um Data Warehouse gerenciado. Justificativa: o volume de dados do projeto é pequeno/médio e não justifica o custo fixo de um DW; o S3 permite consumo tanto por Glue/Spark quanto por ferramentas de BI ou notebooks de ML diretamente sobre os arquivos, sem duplicar dados.
@@ -121,7 +129,7 @@ docs/
         apresentacao.ppt
     evidencias/
         fotos tiradas do S3 para evidências do uso do AWS
-  modelo_dados.md         # documentação das tabelas de dados
+  modelo_dados.md
 notebooks/
   cloud/
     tech_challenge_aws_etl_bronze.ipynb
