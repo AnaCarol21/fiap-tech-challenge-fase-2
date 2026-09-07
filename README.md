@@ -18,10 +18,12 @@ Compreender os fatores que influenciam a alfabetização exige integrar diferent
 
 Construir uma pipeline híbrida (batch + streaming) que:
 
-- integre as seis entidades de dados da plataforma **Base dos Dados** (UF, Município, Meta Alfabetização Brasil, Meta Alfabetização por UF, Meta Alfabetização por Município e Dados de Alunos);
+- integre as seis entidades de dados da plataforma **Base dos Dados** referentes à alfabetização (UF, Município, Meta Alfabetização Brasil, Meta Alfabetização por UF, Meta Alfabetização por Município e Dados de Alunos);
 - padronize, trate e valide essas informações;
-- disponibilize uma camada analítica confiável (Gold) para dashboards, análises estatísticas e futuros modelos de machine learning;
+- disponibilize uma camada analítica confiável (Gold) para dashboards, análises estatísticas e modelos de machine learning;
 - rode em nuvem (AWS), com foco em escalabilidade, qualidade de dados e controle de custos (FinOps).
+
+> **Extensão para a Fase 3**: a mesma pipeline foi estendida com **4 fontes externas de enriquecimento** (PIB dos Municípios, Indicadores Educacionais, População e INSE), formando a base de dados (`alunos_alfabetizacao`) usada para treinar o modelo supervisionado de previsão de alfabetização. Ver seção 3.1.
 
 ## 3. Arquitetura da solução
 
@@ -33,8 +35,8 @@ A pipeline segue a **Arquitetura Medalhão**, com ingestão híbrida convergindo
 2. **Ingestão Streaming** — um Producer Kafka simula eventos quase em tempo real (atualização de indicadores, novas medições de desempenho, atualização de metas), consumidos por um Consumer que persiste os eventos em `bronze_stream.parquet`.
 3. **Camada Bronze** — dados brutos das duas ingestões, sem transformação significativa, com histórico completo preservado. No AWS Glue, um job (`glue_etl_bronze`) lê cada dataset de `raw/` e grava em `bronze/<dataset>/`, com logging de contagem de registros e tratamento de falha por dataset.
 4. **Camada Silver** — limpeza, padronização de tipos e nomes, tratamento de nulos, remoção de duplicidade e **integração entre as bases** (joins entre alunos, município e UF). Executada localmente em Pandas (protótipo) e replicada em PySpark no Glue (`glue_etl_silver`).
-5. **Camada Gold** — datasets analíticos prontos para consumo: ranking de UFs, ranking de municípios, evolução temporal do indicador por UF e resumo agregado por rede de ensino. Executada em Pandas localmente e em PySpark no Glue (`glue_etl_gold`), com checks de qualidade de dados antes da persistência.
-6. **Consumo** — a camada Gold está pronta para alimentar dashboards de BI e, futuramente, modelos preditivos de machine learning.
+5. **Camada Gold** — datasets analíticos prontos para consumo: ranking de UFs, ranking de municípios, evolução temporal do indicador por UF, resumo agregado por rede de ensino, comparação entre meta e resultado, e (Fase 3) a base de alunos enriquecida para modelagem. Executada em Pandas localmente e em PySpark no Glue (`glue_etl_gold`), com checks de qualidade de dados antes da persistência.
+6. **Consumo** — a camada Gold alimenta dashboards de BI e o modelo supervisionado de previsão de alfabetização (Fase 3).
 
 ### Camadas em detalhe
 
@@ -44,16 +46,44 @@ A pipeline segue a **Arquitetura Medalhão**, com ingestão híbrida convergindo
 - Hash de registros para rastreabilidade e detecção de duplicidade futura.
 
 **Silver: dados tratados**
-- Limpeza (remoção de duplicidade, tratamento de nulos essenciais).
+- Limpeza (remoção de duplicidade por **chave de negócio completa** — não linha inteira nem coluna única; ver seção 5), tratamento de nulos essenciais, conversão de tipo.
 - Padronização de nomes de colunas e tipos.
-- Normalização de chaves (`sigla_uf`, `id_municipio`) para permitir joins consistentes.
-- Integração entre as bases (alunos + município + UF).
+- Normalização de chaves territoriais (`sigla_uf`) para permitir joins consistentes.
+- **Preserva os metadados de rastreabilidade da Bronze** (`_record_hash`, `_source_dataset`, `_ingestion_timestamp` etc.) — a limpeza de schema analítico só acontece na Gold.
+- Integração **territorial** entre as bases (alunos + município + UF), com checagem de integridade referencial e consistência.
+- Cada uma das 10 tabelas passa pela mesma pipeline genérica de tratamento — adicionar uma tabela nova (como as 4 de enriquecimento da Fase 3) não exige código novo, só entradas nos dicionários de configuração.
 
 **Gold: camada analítica**
 - `ranking_uf`: ranking de UFs por taxa de alfabetização, por ano e rede de ensino.
 - `ranking_municipio`: mesmo ranking, no nível de município.
 - `evolucao_uf`: série histórica da taxa de alfabetização e proficiência em português por UF.
 - `resumo_rede`: agregados (médias e contagem de UFs) por ano e rede de ensino (Federal, Estadual, Municipal, Privada).
+- `comparacao_meta_uf` / `comparacao_meta_municipio`: taxa observada vs. meta definida para o mesmo ano, com indicador de atingimento.
+- `alunos_alfabetizacao` **(Fase 3)**: base no nível de aluno para o modelo supervisionado, unindo `alunos_integrado` (Silver) às 4 fontes de enriquecimento externo. É aqui — não na Silver — que a curadoria de negócio acontece: quais colunas entram, qual escopo de ano, qual granularidade de junção. Ver seção 3.1.
+
+### 3.1 Enriquecimento externo (Fase 3)
+
+A base `alunos_alfabetizacao` (Gold) é o insumo do modelo supervisionado da Fase 3 (previsão de `alfabetizado`). Ela une `alunos_integrado` (Silver) a 4 fontes externas, todas do mesmo ecossistema Base dos Dados/BigQuery, seguindo a mesma pipeline Bronze → Silver que as 6 tabelas originais:
+
+| Fonte | Dataset BigQuery | Granularidade | Join | Escopo de ano |
+|---|---|---|---|---|
+| PIB dos Municípios | `br_ibge_pib` | Município | `ano + id_municipio` | 2023 |
+| Indicadores Educacionais | `br_inep_indicadores_educacionais` | Município | `ano + id_municipio` (estrutural) e `(ano-1) + id_municipio` (histórico) | 2022 e 2023 |
+| População | `br_ibge_populacao` | Município | `ano + id_municipio` | 2023 |
+| INSE (Nível Socioeconômico) | `br_inep_indicador_nivel_socioeconomico` | Escola, agregado para município | `ano + id_municipio` | 2023 |
+
+**Por que só 2023 (e não 2023+2024)**: o modelo é uma classificação transversal (não uma previsão temporal) — treino e teste acontecem dentro do mesmo ano-base. O filtro de escopo é aplicado na **Gold** (função `gold_alunos_alfabetizacao`), não na extração, porque `alunos` é uma tabela original da Fase 2 e deve manter histórico completo como as demais.
+
+**Defasamento de 1 ano (tratamento de data leakage)**: `tdi_ef_2_ano`, `taxa_aprovacao_ef_2_ano`, `taxa_reprovacao_ef_2_ano` e `taxa_abandono_ef_2_ano` são indicadores de **resultado** do mesmo processo educacional que o modelo tenta prever — usá-los do mesmo ano seria leakage direto (agregado por município, mas ainda assim circular). Por isso essas 4 colunas são unidas com o valor do **ano anterior** (2022 → aluno de 2023), renomeadas com sufixo `_ano_anterior`.
+
+**Por que INSE é agregado por município, e não por escola**: o `id_escola` da tabela `alunos` (avaliação de alfabetização) **não é o código INEP oficial de escola** — é um identificador de outro esquema (descoberto comparando os 2 primeiros dígitos do código, que deveriam ser um código de UF válido e não são). Não existe join possível por escola entre `alunos` e Censo Escolar/INSE. Solução: agregar o INSE por `(ano, id_municipio)` (média do `inse` das escolas do município), perdendo granularidade de escola mas preservando o sinal socioeconômico — documentado como limitação do projeto.
+
+**Por que PIB substituiu o Censo Escolar**: o Censo Escolar (infraestrutura da escola) tinha o mesmo problema de `id_escola` incompatível do INSE. Em vez de agregar mais uma fonte por município (com a mesma perda de granularidade), optamos por substituí-lo pelo PIB dos Municípios, que já nasce na granularidade de município — sem necessidade de agregação. Usamos `pib_per_capita` (calculado a partir de `pib / populacao`), não `pib` bruto, para não misturar tamanho do município com riqueza. As colunas de detalhamento setorial do PIB (`va_agropecuaria`, `va_industria` etc.) vieram 100% nulas para 2023 na fonte e foram removidas do Gold.
+
+**Colunas de risco de data leakage** (mantidas na tabela por transparência, mas que **não podem** ser usadas como feature no treino — ver `COLUNAS_RISCO_DATA_LEAKAGE` no notebook Gold):
+- `proficiencia` — define o próprio alvo (corte de 743 pontos)
+- `taxa_alfabetizacao_municipio` / `taxa_alfabetizacao_uf` — agregados que já incluem o resultado do próprio aluno
+- `media_portugues_municipio` / `media_portugues_uf` — mesmo mecanismo acima
 
 ## 4. Tecnologias utilizadas
 
@@ -83,6 +113,9 @@ A extração dos dados foi feita via BigQuery (GCP), consultando a Base dos Dado
 **Data Lake vs. Data Warehouse**
 Escolhemos Data Lake (S3 + Parquet) em vez de um Data Warehouse gerenciado. Justificativa: o volume de dados do projeto é pequeno/médio e não justifica o custo fixo de um DW; o S3 permite consumo tanto por Glue/Spark quanto por ferramentas de BI ou notebooks de ML diretamente sobre os arquivos, sem duplicar dados.
 
+**Chave de negócio completa no dedup da Silver (lição aprendida rodando com dado real)**
+Inicialmente o dedup da Silver usava chaves incompletas em duas tabelas: `uf`/`municipio` deduplicavam só por `ano+sigla_uf`/`ano+id_municipio` (ignorando `serie`/`rede`), e `alunos` deduplicava só por `id_aluno` (ignorando `ano`). Rodando com dado real, isso causou perda silenciosa de dado de verdade: `uf` perdia ~66% das linhas (múltiplas redes por UF colapsadas em uma só), e `alunos` perdia ~39% das linhas (o mesmo `id_aluno` se repete entre 2023 e 2024 — não é o mesmo estudante, é um identificador reaproveitado a cada edição da avaliação). Corrigido usando a chave de negócio **completa** em cada tabela (`CHAVE_NEGOCIO` no notebook Silver), validada com testes automatizados que reproduzem o cenário de perda antes/depois da correção.
+
 **Custo vs. Performance**
 - Worker `G.1X` (o menor perfil disponível no Glue) foi suficiente para o volume atual, evita pagar por capacidade computacional ociosa.
 - Parquet particionado reduz custo de leitura em queries futuras (leitura seletiva de colunas/partições).
@@ -90,19 +123,23 @@ Escolhemos Data Lake (S3 + Parquet) em vez de um Data Warehouse gerenciado. Just
 
 ## 6. Regras de qualidade de dados (Data Quality)
 
-Cada camada Gold passa por checks antes da persistência:
+Cada tabela, em cada camada (Bronze, Silver e Gold), passa por checks antes da persistência:
 
-- **Verificação de duplicidade**
+- **Verificação de duplicidade**, por chave de negócio completa (não linha inteira nem coluna única).
 - **Detecção de valores ausentes** em colunas-chave (`sigla_uf`, `id_municipio`, `ano`, `ranking`).
 - **Validação de intervalo** (`taxa_alfabetizacao` e `media_portugues` entre 0 e 100).
-- **Validação de volume mínimo** (contagem mínima de registros por dataset, calculada dinamicamente a partir da cardinalidade real dos dados, não um valor fixo).
+- **Validação de volume mínimo** (contagem mínima de registros por dataset, calculada a partir da cardinalidade real dos dados).
+- **Integridade referencial** (`checar_integridade_referencial`): valida se toda chave estrangeira (ex.: `id_municipio` de um aluno) existe na tabela de referência. Roda no mesmo lugar onde o join acontece — na Silver, para o join territorial (alunos+município+UF); na Gold, para os joins de enriquecimento externo (Fase 3).
+- **Consistência entre tabelas** (`checar_consistencia_territorial`): valida se a UF derivada de um município bate com uma UF real da tabela de referência.
 
-Falhas de qualidade interrompem o job (`assert`), evitando que dados inconsistentes cheguem à camada Gold.
+Cada check tem um campo `critico` (`True`/`False`): falhas críticas interrompem o job (`raise`); falhas não-críticas viram alerta (`WARN`) no log e o pipeline segue — usado para casos em que um percentual pequeno de inconsistência é esperado (ex.: alguns municípios sem cobertura de INSE) e não deve travar toda a execução.
 
 ## 7. Monitoramento
 
 - **Logging estruturado** em todas as camadas (local com `logging`, em nuvem com o logger nativo do Glue/CloudWatch), registrando: início/fim de cada etapa, contagem de registros processados, sucesso/falha por dataset.
-- Na Bronze em nuvem, falhas em um dataset específico não derrubam o job inteiro — o erro é capturado, logado e reportado ao final, permitindo diagnosticar rapidamente qual fonte falhou.
+- **Métricas em formato campo=valor** (`log_metrica`), consultáveis via CloudWatch Logs Insights (ex.: `filter evento = "tabela_processada"`), com latência e volume por tabela — não só texto solto em linha de log.
+- **Alertas** (`emitir_alerta`): toda falha (por tabela ou agregada ao fim do pipeline) é logada em nível `ERROR` e, se um tópico SNS estiver configurado (`SNS_TOPIC_ARN`), publica uma notificação real.
+- **Isolamento de falha por tabela**: cada tabela roda dentro de um `try/except` individual nas 3 camadas — a falha de uma tabela não impede o processamento das demais.
 - Os logs ficam disponíveis no **CloudWatch**, permitindo rastrear volume processado e detectar falhas de ingestão sem acesso direto ao cluster.
 
 ## 8. FinOps — otimização de custos
@@ -116,9 +153,9 @@ Falhas de qualidade interrompem o job (`assert`), evitando que dados inconsisten
 
 A camada Gold foi desenhada para servir de base a análises mais avançadas:
 
-- **Modelos preditivos de alfabetização por município**: usando `evolucao_uf` e `ranking_municipio` como base histórica para prever a evolução do indicador.
-- **Clusters de vulnerabilidade educacional**: agrupando municípios por padrões de desempenho e infraestrutura (especialmente se combinado com fontes externas como Censo Escolar, IBGE e Cadastro Único).
-- **Análise de desigualdade educacional**: comparações entre redes de ensino (`resumo_rede`) e entre UFs (`ranking_uf`) para embasar políticas públicas com evidências.
+- **Modelo supervisionado de previsão de alfabetização (Fase 3, já implementado)**: `alunos_alfabetizacao` combina dados do aluno, território, PIB, indicadores educacionais e nível socioeconômico (INSE) para prever `alfabetizado`, com tratamento explícito de data leakage. Ver seção 3.1.
+- **Análise de desigualdade educacional**: comparações entre redes de ensino (`resumo_rede`) e entre UFs (`ranking_uf`), e entre meta e resultado (`comparacao_meta_uf`/`comparacao_meta_municipio`), para embasar políticas públicas com evidências.
+- **Clusters de vulnerabilidade educacional**: agrupando municípios por padrões de desempenho, PIB per capita e nível socioeconômico.
 
 ## 10. Estrutura do repositório
 
@@ -137,5 +174,12 @@ notebooks/
     tech_challenge_aws_etl_gold.ipynb
   kafka/
     tech_challenge_kafka_streaming.ipynb
+infra/
+  README.md            # infraestrutura como código (Terraform) - ver nota abaixo
+  *.tf
+  glue_scripts/
+  diagnostico_*.sql, diagnostico_*.py   # scripts de diagnóstico usados durante o desenvolvimento
 README.md
 ```
+
+> **Nota sobre `infra/`**: os scripts em `infra/glue_scripts/` são gerados a partir dos notebooks em `notebooks/cloud/` e podem ficar desatualizados se os notebooks forem editados depois. Regenerar antes de aplicar o Terraform (`jupyter nbconvert --to script`).
